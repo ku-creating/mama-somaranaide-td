@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>虫、入れないで!(A/Bテスト版)</title>
+<style>
+  html,body{margin:0;height:100%;background:#1e1a16;overscroll-behavior:none;touch-action:none;}
+  body{display:flex;align-items:center;justify-content:center;font-family:"Hiragino Sans","Yu Gothic",sans-serif;}
+  #wrap{width:520px;max-width:100vw;height:820px;max-height:100vh;background:#f6efe3;position:relative;overflow:hidden;}
+  canvas{width:100%;height:100%;display:block;}
+  #note{position:fixed;bottom:4px;left:0;right:0;text-align:center;color:#8a847a;font-size:11px;}
+  #intro{position:absolute;inset:0;z-index:10;background:rgba(20,16,12,0.92);display:flex;align-items:center;justify-content:center;padding:18px;box-sizing:border-box;}
+  #introCard{background:#e4d6ac;border:1.5px solid #3d3320;padding:22px 20px;max-width:440px;color:#241f18;font-family:"Hiragino Sans","Yu Gothic",sans-serif;box-shadow:3px 5px 10px rgba(0,0,0,0.5);}
+  #introCard h1{font-size:19px;margin:0 0 8px;}
+  #introCard p{font-size:13px;line-height:1.6;margin:0 0 10px;}
+  #introCard ul{font-size:13px;line-height:1.7;margin:0 0 12px;padding-left:18px;}
+  #introCard .tip{background:rgba(60,52,36,0.1);padding:8px 10px;border-left:3px solid #8a5a3a;}
+  #introStart{display:block;width:100%;margin-top:14px;padding:12px;font-size:15px;font-weight:700;background:#3a6e3c;color:#f3efe6;border:1px solid #1e3d1f;cursor:pointer;}
+  #introStart:active{background:#2e5a30;}
+</style>
+</head><body>
+<div id="wrap">
+  <canvas id="c" width="520" height="820"></canvas>
+  <div id="intro"><div id="introCard">
+    <h1>虫、入れないで!</h1>
+    <p>家のすき間から、虫が次々と部屋の奥へ歩いてくる。殺虫アイテムをマスに置いて、虫が届く前に駆除しよう。</p>
+    <ul>
+      <li>マス目をタップ → 選んだアイテムを置く(壁になる。道を完全には塞げない)</li>
+      <li>虫が1匹でも部屋の奥に届いたら、その日は負け</li>
+      <li>下の5枚から、置きたいアイテムを先に選んでからタップ</li>
+      <li>同じアイテムを続けて置くと、次に置く分の値段が上がる</li>
+      <li>置いたアイテムをもう一度タップすると撤去(半額戻る)</li>
+    </ul>
+    <p class="tip">コツ: 虫には種類があり、アイテムごとに得意・苦手がある(置く前に「効く/効きにくい」が出る)。粘着シートで遅くしてから、他のアイテムで畳みかけると強い。</p>
+    <button id="introStart">わかった、はじめる</button>
+  </div></div>
+</div>
+<div id="note">A/Bテスト版(ゴキブリ×殺虫剤テーマ): マス目をタップしてアイテムを置く(壁になる)。完全に道を塞ぐことはできない</div>
+<script>
+'use strict';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 520, H = 820;
+const P = new URLSearchParams(location.search);
+const num = (key, def) => { const v = P.get(key); return v === null ? def : parseFloat(v); };
+
+// ---- 盤面(Desktop Tower Defenseの核ルールを、忠実に真似る) ----
+// マスの数はURLで変えて試せる(?cols=9&rows=11 のように。2026-09-26、「マスを広げた方が面白そう」という直感を安く検証するため)
+const COLS = Math.round(num('cols', 9)), ROWS = Math.round(num('rows', 11));   // 元は7x9。まず9x11で試す
+const GRID_TOP = 110, GRID_LEFT = 30, DOCK_Y = 700;
+const CELL = Math.floor(Math.min((W - GRID_LEFT * 2) / COLS, (DOCK_Y - GRID_TOP) / ROWS));
+// 入口の数・位置(2026-09-26)。固定だと、すぐ「安全なマス」がバレて飽きるので、日ごとに数も場所も変える。
+// ?entrances=3 等で、テスト用に固定することもできる(未指定なら、日ごとに自動で増える)
+const ENTRANCE_OVERRIDE = P.has('entrances') ? Math.max(1, Math.min(4, Math.round(num('entrances', 2)))) : null;
+function entranceCountForDay(d) { return ENTRANCE_OVERRIDE || Math.min(4, 2 + Math.floor((d - 1) / 2)); }  // 1〜2日目:2、3〜4日目:3、5〜6日目:4
+function shuffle(arr) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function pickEntranceCols(n) {   // 両端(壁際)を除いた列から、毎回ランダムに選ぶ。マス数が変わっても追従する(2026-09-26)
+  const candidates = Array.from({ length: COLS - 2 }, (_, i) => i + 1);
+  return shuffle(candidates).slice(0, n).sort((a, b) => a - b);
+}
+let STARTS = [{ r: 0, c: 3 }];   // setupDay(1)で、すぐ上書きされる(初期値はダミー)
+let START = STARTS[0];                               // 後方互換(単体参照している箇所向け)
+const GOAL  = { r: ROWS - 1, c: Math.floor(COLS / 2) }; // ママ(下)
+function cellXY(r, c) { return { x: GRID_LEFT + c * CELL + CELL / 2, y: GRID_TOP + r * CELL + CELL / 2 }; }
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`; }
+
+// ---- 家族カード(既存のカード・相性をそのまま流用) ----
+const STRONG = { source: ['spi', 'conspiracy'], listen: ['gossip', 'neighbor'], deflect: ['sales', 'short'] };
+const CARDS = [
+  // A/Bテスト版(2026-10-03): 数値(power/cost/cd/weak/range/slow/aoe)は一切変更しない。name/who/whoIconだけ「ゴキブリ×殺虫剤」テーマに差し替える
+  { id: 'source',  name: 'ロングスプレー',     who: '遠距離スプレー', whoIcon: '🧴', power: 16, cost: 19, cd: 2.0, weak: 0.3, color: '#2f9fd0', range: 2 },
+  { id: 'listen',  name: 'パチンと一撃',       who: 'ハエたたき',     whoIcon: '🏏', power: 11, cost: 20, cd: 0.8, weak: 0.3, color: '#e0674f', range: 1 },
+  { id: 'deflect', name: 'ベタッと粘着',       who: '粘着シート',     whoIcon: '🕸️', power: 18, cost: 22, cd: 1.6, weak: 0.3, color: '#54ad63', range: 1, slow: 1.5 },
+  { id: 'meet',    name: '部屋ごとくん煙',     who: 'くん煙剤',       whoIcon: '💨', power: 16, cost: 15, cd: 4.5, weak: 1.0, color: '#e0a92f', range: 1, aoe: true },
+  { id: 'ignore',  name: 'とりあえず設置',     who: '置き型ベイト',   whoIcon: '📦', power: 4, cost: 5, cd: 2.0, weak: 1.0, color: '#8a847a', range: 1 },
+];
+// A/Bテスト版: 実写画像は使わない(ゴキブリ版テーマに合わないため)。常に絵文字フォールバックにする
+const CHAR_IMAGES = {};
+const CARD_IMG_KEY = { source: 'father', listen: 'sister', deflect: 'daughter', meet: 'family' };   // ignore(壁)は看板の下地テクスチャとして別扱い(下記drawWallTexture参照)
+function drawWallTexture(ctx, x, y, w, h, radius) {   // 壁カードの看板下地を、実写の木目テクスチャで描く(2026-09-27)。読み込み前は元の色塗りにフォールバック
+  const img = CHAR_IMAGES['wall_texture'];
+  if (!img || !img.complete || img.naturalWidth === 0) return false;
+  ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, w, h, radius); ctx.clip();
+  ctx.drawImage(img, x, y, w, h);
+  ctx.restore(); return true;
+}
+const CAT_IMG_KEY = { sales: 'enemy_sales', short: 'enemy_sns', gossip: 'enemy_sns', spi: 'enemy_spi', conspiracy: 'enemy_spi', neighbor: 'enemy_neighbor' };
+
+// === UIトンマナ(Papers Please型)ヘルパー(2026-09-27)。第三者診断で「均一で物理法則に基づかない質感」「影が均等」「角丸不統一」を指摘され、それに対応する ===
+function paperFiber(x, y, w, h, seed) {
+  const rnd = (n) => { const v = Math.sin(seed + n * 12.9898) * 43758.5453; return v - Math.floor(v); };
+  for (let i = 0; i < 10; i++) {
+    const fx = x + rnd(i) * w, fy = y + rnd(i + 50) * h;
+    const fw = 20 + rnd(i + 100) * 40, fh = 14 + rnd(i + 150) * 26;
+    ctx.fillStyle = `rgba(${140 + rnd(i) * 40},${118 + rnd(i) * 30},${80 + rnd(i) * 20},${0.03 + rnd(i + 200) * 0.04})`;
+    ctx.beginPath(); ctx.ellipse(fx, fy, fw, fh, rnd(i + 250) * 3, 0, 6.29); ctx.fill();
+  }
+}
+function paperStain(x, y, w, h, rot, alpha) {   // 因果関係のある汚れ(角に置く前提)。draw()は毎フレーム呼ばれるため、Math.random()を直接使うとシミの形が毎フレーム変わって「うねうね動く」バグになる。座標からシード化した疑似乱数で固定する(2026-10-02修正)
+  const rnd = (n) => { const v = Math.sin(x * 12.9898 + y * 78.233 + n * 37.719) * 43758.5453; return v - Math.floor(v); };
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  for (let i = 0; i < 5; i++) {
+    const s = 1 - i * 0.18;
+    ctx.fillStyle = `rgba(100,78,42,${alpha * (0.2 + i * 0.09)})`;
+    ctx.beginPath(); ctx.ellipse((rnd(i) - 0.5) * w * 0.4, (rnd(i + 10) - 0.5) * h * 0.4, w * s, h * s, rnd(i + 20) * 3, 0, 6.29); ctx.fill();
+  }
+  ctx.restore();
+}
+function inkStamp(cx, cy, rot, w, h, color, text, fontSize) {   // かすれ・滲みのあるスタンプ。これもdraw()で毎フレーム呼ばれるため、Math.random()直使用だと枠がガタガタ動いて見えるバグになる。座標からシード化(2026-10-02修正)
+  const rnd = (n) => { const v = Math.sin(cx * 12.9898 + cy * 78.233 + n * 37.719) * 43758.5453; return v - Math.floor(v); };
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(rot);
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = color; ctx.lineWidth = 2 - i * 0.4; ctx.globalAlpha = 0.75 - i * 0.2;
+    ctx.strokeRect(-w / 2 + (rnd(i) - 0.5) * 1.5, -h / 2 + (rnd(i + 5) - 0.5) * 1.5, w, h);
+  }
+  ctx.globalAlpha = 1; ctx.fillStyle = 'rgba(228,214,172,0.5)';
+  for (let i = 0; i < 4; i++) ctx.fillRect(-w / 2 + rnd(i + 10) * w, -h / 2 + rnd(i + 20) * h, 8, 2);
+  ctx.globalAlpha = 0.82; ctx.fillStyle = color; ctx.font = `900 ${fontSize}px "Courier New",monospace`; ctx.textAlign = 'center';
+  ctx.fillText(text, 0, fontSize * 0.35);
+  ctx.restore();
+}
+function paperPanel(x, y, w, h, dim) {   // 「紙の切り抜き」パネル。角丸なし、方向性のある影(2026-09-27。角丸ソシャゲカード文法をやめて統一)
+  ctx.save();
+  if (!dim) { ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 10; ctx.shadowOffsetX = 3; ctx.shadowOffsetY = 5; }
+  else ctx.globalAlpha = 0.68;
+  ctx.fillStyle = dim ? '#b8a878' : '#e4d6ac';
+  ctx.fillRect(x, y, w, h);
+  ctx.restore();
+  paperFiber(x, y, w, h, x * 7 + y * 3);
+  ctx.strokeStyle = dim ? 'rgba(50,42,26,0.4)' : '#3d3320'; ctx.lineWidth = dim ? 1 : 1.5;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+}
+function drawCharImg(ctx, key, x, y, r, opts) {   // 円形に切り抜いて描画。まだ読み込み中なら false を返す(呼び出し側は絵文字にフォールバック)
+  const img = CHAR_IMAGES[key];
+  if (!img || !img.complete || img.naturalWidth === 0) return false;
+  ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, 6.29); ctx.clip();
+  if (opts) {
+    if (opts.grayscale) ctx.filter = `grayscale(${opts.grayscale})`;
+    if (opts.alpha !== undefined) ctx.globalAlpha = opts.alpha;
+  }
+  ctx.drawImage(img, x - r, y - r, r * 2, r * 2);
+  ctx.restore(); return true;
+}
+const DYING_DURATION = 0.6;   // 退場演出(モノクロ化+フェードアウト)の長さ(秒)。2026-09-27、本人が選んだ「シンプルな方が面白い」に沿った案
+function cardPower(card, cat) {
+  if (card.weak === 1.0) return card.power;
+  return (STRONG[card.id] || []).includes(cat) ? card.power : card.power * card.weak;
+}
+// weak係数は0.3のままだと「何発当てても減らない」体感になるので、表示・演出用の下限は変えず、
+// 実ダメージだけ底上げする(2026-09-26。「効いてない感」対策。相性の差は残しつつ、無力感は消す)
+const MIN_WEAK_RATIO = 0.5;
+function cardPowerPlayable(card, cat) {
+  const raw = cardPower(card, cat);
+  return raw < card.power * MIN_WEAK_RATIO ? card.power * MIN_WEAK_RATIO : raw;
+}
+// A/Bテスト版: カテゴリ名(sales/short/gossip/spi/conspiracy/neighbor)の中身はSTRONG相性に合わせて虫の種類にマップ。STRONGの定義自体は変えない
+const WORDS = [
+  { str: 'カサカサ…', cat: 'neighbor' }, { str: 'かゆい…', cat: 'neighbor' },
+  { str: 'カサッ', cat: 'sales' }, { str: 'サッと逃げる', cat: 'sales' },
+  { str: 'プーン', cat: 'short' }, { str: 'まとわりつく', cat: 'short' },
+  { str: 'するする…', cat: 'gossip' },
+  { str: 'うねうね', cat: 'spi' }, { str: '物陰から', cat: 'spi' },
+  { str: 'ワラワラ', cat: 'conspiracy' }, { str: '大量発生', cat: 'conspiracy' },
+];
+const RESIST_CATS = ['spi', 'conspiracy'];
+// 虫の種類ごとの色・アイコン(sales=ゴキブリ, short=コバエ, gossip=クモ, spi=ムカデ, conspiracy=ヤスデ, neighbor=ダニ)
+const CAT_STYLE = {
+  sales: { color: '#5a3d2a', icon: '🪳' }, short: { color: '#6b7a3d', icon: '🪰' }, gossip: { color: '#2f2f2f', icon: '🕷️' },
+  spi: { color: '#4a2f1a', icon: '🐛' }, conspiracy: { color: '#3a3a1a', icon: '🐜' }, neighbor: { color: '#8b2222', icon: '🦟' },
+};
+CARDS.forEach(c => { c.beats = STRONG[c.id] || Object.keys(CAT_STYLE); });   // このカードが得意なジャンル一覧(表示用)
+// 何ができるカードか、将棋の駒のように一目で分かるようにする(2026-09-26。「誰がどこに行くか分からない」という指摘への対応)
+function roleLabel(c) {
+  if (c.power <= 2) return '壁専用(攻撃ほぼ無し)';
+  if (c.aoe) return 'まとめて攻撃';
+  if (c.slow) return '動きを遅くする';
+  if ((c.range || 1) >= 2) return '遠くまで届く';
+  if (c.cd <= 1.0) return '手数で攻める';
+  return 'すぐ隣だけ';
+}
+const ENDINGS = { neighbor: '部屋の隅に、ダニが住み着いた。', sales: 'ゴキブリが台所を走り回った。', short: 'コバエが、食べ物にたかった。', gossip: 'クモが、天井に巣を張った。', spi: 'ムカデが、ベッドの下に潜んだ。', conspiracy: 'ヤスデが、玄関から溢れた。' };
+
+// ---- 日ごとの難易度(既存の考え方を流用。染まり度はカード威力ちょうどに固定=1発必殺を守る) ----
+const TOTAL_DAYS = 6;
+const SUSP_BASE = num('susp', 22);
+const INCOME_PER_SEC = num('income', 2);   // DTD本家は「時間で貯まる」でなく「倒して稼ぐ」経済。時間収入は最低限に落とし、撃破報酬を主にする(2026-09-26)
+const KILL_REWARD = num('reward', 5);      // 1体言い返せるごとに貰える(壁の量産に、自然なブレーキをかける)
+const CELL_TIME = num('cellTime', 0.55);           // 1マス進むのにかかる秒数(小さいほど速い)
+function suspForDay(d) { return SUSP_BASE; }
+function postsForDay(d) { return 8 + (d - 1) * 3; }
+function intervalForDay(d) { return Math.max(0.7, 2.0 * Math.pow(0.93, d - 1)); }
+
+// ---- 盤面の状態 ----
+let grid = [];              // grid[r][c] = null または カードid
+function resetGrid() { grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null)); }
+resetGrid();
+
+// BFS: 入口→ママまでの最短経路(壁=タワーは通れない)。DTDの核心ルール。入口は複数あるので、どれから出すか指定する
+function findPath(tempGrid, start) {
+  start = start || STARTS[0];
+  const key = (r, c) => r + ',' + c;
+  const q = [[start.r, start.c]], came = new Map([[key(start.r, start.c), null]]);
+  while (q.length) {
+    const [r, c] = q.shift();
+    if (r === GOAL.r && c === GOAL.c) {
+      const path = []; let cur = key(r, c);
+      while (cur !== null) { const [rr, cc] = cur.split(',').map(Number); path.unshift({ r: rr, c: cc }); cur = came.get(cur); }
+      return path;
+    }
+    for (const [dr, dc] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) {
+      const nr = r + dr, nc = c + dc;
+      if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
+      if (tempGrid[nr][nc]) continue;                          // タワー(壁)は通れない
+      const k = key(nr, nc);
+      if (came.has(k)) continue;
+      came.set(k, key(r, c)); q.push([nr, nc]);
+    }
+  }
+  return null;   // 道がない
+}
+
+// 敵の実際の移動用: タワーの射程内を通ると「割高」になる、重み付き最短経路(ダイクストラ)。
+// 完全に射程を避けられるようにすると、タワーが無意味になってしまうため、封鎖はしない代わりに「避けたくなる」コストだけを積む(2026-09-26)
+function findPathWeighted(tempGrid, start) {
+  start = start || STARTS[0];
+  const key = (r, c) => r + ',' + c;
+  const danger = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!tempGrid[r][c]) continue;
+    const card = CARDS.find(cd => cd.id === tempGrid[r][c]);
+    const rg = (card && card.range) || 1;
+    for (let dr = -rg; dr <= rg; dr++) for (let dc = -rg; dc <= rg; dc++) {
+      const nr = r + dr, nc = c + dc;
+      if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) danger[nr][nc]++;
+    }
+  }
+  const DANGER_COST = 0.6;   // 射程内を1マス通るごとの追加コスト(直進1マス分=1が基準)。3だと強すぎて、孤立したタワー1個がほぼ完全に迂回され、当たる機会自体が無くなっていた(2026-09-26)
+  const dist = new Map([[key(start.r, start.c), 0]]);
+  const came = new Map([[key(start.r, start.c), null]]);
+  const done = new Set();
+  while (true) {
+    let ck = null, cd = Infinity;
+    for (const [k, d] of dist) { if (!done.has(k) && d < cd) { cd = d; ck = k; } }
+    if (ck === null) break;
+    done.add(ck);
+    const [r, c] = ck.split(',').map(Number);
+    if (r === GOAL.r && c === GOAL.c) break;
+    for (const [dr, dc] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) {
+      const nr = r + dr, nc = c + dc;
+      if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
+      if (tempGrid[nr][nc]) continue;
+      const nk = key(nr, nc);
+      const cost = 1 + danger[nr][nc] * DANGER_COST;
+      const nd = cd + cost;
+      if (!dist.has(nk) || nd < dist.get(nk)) { dist.set(nk, nd); came.set(nk, ck); }
+    }
+  }
+  const gk = key(GOAL.r, GOAL.c);
+  if (!dist.has(gk)) return null;
+  const path = []; let cur = gk;
+  while (cur !== null) { const [rr, cc] = cur.split(',').map(Number); path.unshift({ r: rr, c: cc }); cur = came.get(cur); }
+  return path;
+}
+
+// プレイログ(2026-09-27。「何が起きたか正確に見たい」という要望への対応)。localStorageに貯め、後でClaude側が読める
+let gameLog = [];
+function glog(type, data) { gameLog.push({ t: Math.round(t * 10) / 10, day, type, ...data }); if (gameLog.length > 3000) gameLog.shift(); try { localStorage.setItem('td_gamelog', JSON.stringify(gameLog)); } catch (e) {} }
+let day = 1, kizukai = 40, phase = 'prep', ROUND_POSTS, SPAWN_INTERVAL, MAX_SUSPICION;
+let posts = [], spawned = 0, spawnTimer = 0, escaped = 0, calmed = 0, t = 0, lastCat = null;
+let cooldowns = {};    // マスごとのクールダウン(key: "r,c")
+let popups = [], flashCell = null, projectiles = [];   // projectiles: 攻撃してる感を出す飛翔エフェクト(2026-09-26)   // popups: 同時に何個も出せるように配列化(2026-09-26。前は1個しか表示できず、上書きされて消えていた)
+let daySchedule = [];   // その日の、出現予定リスト(事前に決めておく。結果は隠すが、材料=予定は見せられるようにする)
+const ALL_CATS = Object.keys(CAT_STYLE);
+// ジャンルごとの速さの違い(全員同じ速さだと、読む材料がなくなるため。2026-09-26)
+const CAT_SPEED = { spi: 1.35, conspiracy: 1.35, sales: 0.8, short: 0.8, gossip: 1.0, neighbor: 1.0 };  // 数値が大きいほど、1マスにかかる時間が長い(遅い)
+
+function buildDaySchedule(n) {
+  const sched = [];
+  for (let i = 0; i < n; i++) {
+    const cat = ALL_CATS[Math.floor(Math.random() * ALL_CATS.length)];
+    const pool = WORDS.filter(w => w.cat === cat);
+    const w = pool[Math.floor(Math.random() * pool.length)];
+    const entrance = STARTS[Math.floor(Math.random() * STARTS.length)];
+    sched.push({ cat, str: w.str, entrance });
+  }
+  return sched;
+}
+
+function startKizukaiForDay(d) { return 60 + (d - 1) * 9; }   // 持ち越しなしのまま、日ごとに初期資金を増やす。カードコストを理論値で再設計した際、経済側の絶対値キャリブレーションが抜けていて資金不足になったので、初期値を40→60に上げた(2026-09-27)
+function setupDay(d) {
+  day = d; ROUND_POSTS = postsForDay(d); SPAWN_INTERVAL = intervalForDay(d); MAX_SUSPICION = suspForDay(d);
+  kizukai = startKizukaiForDay(d); phase = 'prep'; posts = []; spawned = 0; spawnTimer = 0; escaped = 0; calmed = 0; t = 0;
+  STARTS = pickEntranceCols(entranceCountForDay(d)).map(c => ({ r: 0, c }));   // 入口の数・位置を、日ごとに変える
+  START = STARTS[0];
+  resetGrid(); cooldowns = {};
+  daySchedule = buildDaySchedule(ROUND_POSTS);   // 出現順を先に決めておく(材料を見せられるように)
+}
+function startDay() { if (phase === 'prep') phase = 'play'; }
+function restart() { setupDay(1); }
+function nextDay() { setupDay(Math.min(TOTAL_DAYS, day + 1)); }
+setupDay(1);
+
+function popup(str, x, y, color) { popups.push({ str, x, y, color: color || '#7a1f1f', t: 0.8 }); }
+
+let curCardIdx = 0;
+// 置くたびに、次の1個のコストが上がる(2026-09-27。「一様に敷き詰めるのが最適解になってる」対策。アップグレードが無い今、量産に歯止めをかける)
+function countByCard(cardId) { let n = 0; for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (grid[r][c] === cardId) n++; return n; }
+function totalTowers() { let n = 0; for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (grid[r][c]) n++; return n; }
+function effectiveCost(card) { return Math.round(card.cost * Math.pow(1.15, countByCard(card.id))); }   // 線形(+15%ずつ)だと時間をかければ大量に買えてしまったので、指数(×1.15ずつ)に強化(2026-09-27)。同じ種類を20個も置けば、コストが約16倍に跳ね上がる
+// 配置: マスをタップして、家族タワーを置く。「完全に道を塞ぐこと」は禁止(DTDの核心ルール)
+function placeTower(r, c) {
+  if (phase !== 'prep' && phase !== 'play') return;
+  if (grid[r][c]) {
+    // 既に置いてある看板をタップ = 撤去(半額戻し)。DTD本家の「安く仮置き→後で建て直す」戦略に対応(2026-09-26。今まで置き直す手段が無く「対処する術がない」状態だった)
+    const existing = CARDS.find(cd => cd.id === grid[r][c]);
+    kizukai += Math.floor(existing.cost / 2);
+    grid[r][c] = null; delete cooldowns[r + ',' + c];
+    posts.forEach(p => { if (p.done) return; const np = findPathWeighted(grid, p.path[p.idx]); if (np) { p.path = np; p.idx = 0; p.moveT = 0; } });
+    popup('撤去(半額戻し)', cellXY(r, c).x, cellXY(r, c).y, '#8a5a3a');
+    return;
+  }
+  if (STARTS.some(s => s.r === r && s.c === c)) return;         // 入口には置けない
+  if (r === GOAL.r && c === GOAL.c) return;                      // ママの場所には置けない
+  if (posts.some(p => !p.done && p.path[p.idx].r === r && p.path[p.idx].c === c)) { popup('敵がいる場所には置けない', cellXY(r, c).x, cellXY(r, c).y); return; }   // 敵の列に割り込んで範囲攻撃で一気に巻き込む抜け道を塞ぐ(2026-09-27)
+  // 配置数の上限は撤回(2026-09-27)。元ネタは「置ける場所自体を絞る」のでなく「経済だけで自然に絞る」方式だった。本人の判断「配置制限は選択肢が減って面白くない」を受け、コスト逓増(経済)だけで量産を抑える方針に統一
+  const card = CARDS[curCardIdx];
+  const cost = effectiveCost(card);
+  if (kizukai < cost) return;
+  const trial = grid.map(row => row.slice()); trial[r][c] = card.id;
+  if (STARTS.some(s => !findPath(trial, s))) { popup('道が塞がるので置けない', cellXY(r, c).x, cellXY(r, c).y); return; }  // DTDの核心ルール。どちらの入口からも、道が残る必要がある
+  kizukai -= cost; grid[r][c] = card.id; cooldowns[r + ',' + c] = 0;
+  glog('place', { card: card.id, at: r + ',' + c, cost, nearby: posts.filter(p => !p.done && Math.abs(p.path[p.idx].r - r) <= 1 && Math.abs(p.path[p.idx].c - c) <= 1).length });
+  // 「飛び越えてる」対策: 置いた瞬間、今すでに歩いてる敵も、今いる場所から経路を計算し直す(DTDの核心:リアルタイム再計算)。これが無かったので、後から置いた看板を無視して直進していた
+  posts.forEach(p => {
+    if (p.done) return;
+    const newPath = findPathWeighted(grid, p.path[p.idx]);
+    if (newPath) { p.path = newPath; p.idx = 0; p.moveT = 0; }
+  });
+}
+
+function update(dt) {
+  t += dt;
+  if (phase === 'play') kizukai += INCOME_PER_SEC * dt;   // 収入は、始めた後だけ(準備中に待って貯める抜け穴を、修正)
+  if (flashCell) { flashCell.t += dt; if (flashCell.t > 0.25) flashCell = null; }
+  popups.forEach(p => p.t -= dt); popups = popups.filter(p => p.t > 0);   // ダメージ数字を、時間で消えるように(前は消えずに残り続けていた)
+  projectiles.forEach(p => p.t += dt); projectiles = projectiles.filter(p => p.t < 0.15);
+  if (phase !== 'play') return;
+  Object.keys(cooldowns).forEach(k => { if (cooldowns[k] > 0) cooldowns[k] -= dt; });
+  spawnTimer -= dt;
+  if (spawnTimer <= 0 && spawned < ROUND_POSTS) {
+    spawnTimer = SPAWN_INTERVAL;
+    const entry = daySchedule[spawned];   // 事前に決めておいた予定から、順番に出す(材料は事前に見せられる)
+    spawned++;
+    const path = findPathWeighted(grid, entry.entrance);
+    if (path) { const post = { path, idx: 0, moveT: 0, susp: MAX_SUSPICION, cat: entry.cat, str: entry.str, done: false, dying: false, dyingT: 0, speed: CAT_SPEED[entry.cat] || 1.0 }; posts.push(post); glog('spawn', { cat: entry.cat, entrance: entry.entrance }); }
+  }
+  // 敵(情報)が、経路に沿って進む。ジャンルごとに速さが違う(読む材料にする。2026-09-26)
+  for (const p of posts) {
+    if (p.done) continue;
+    if (p.dying) { p.dyingT += dt; if (p.dyingT >= DYING_DURATION) p.done = true; continue; }   // 退場演出中は動かない(2026-09-27)
+    if (p.slowT > 0) p.slowT -= dt;   // スロウ中は移動が遅くなる(2026-09-26、娘カードの効果)
+    // 渋滞: 次のマスに既に他の敵がいたら進まない(2026-09-27)。速い敵が遅い敵に追いついて同じマスに重なり、
+    // 範囲攻撃1発で2体同時に倒せてしまう抜け道になっていたのを塞ぐ
+    const nextCell = p.path[Math.min(p.idx + 1, p.path.length - 1)];
+    const blocked = posts.some(o => o !== p && !o.done && o.path[o.idx].r === nextCell.r && o.path[o.idx].c === nextCell.c);
+    if (blocked) continue;
+    p.moveT += dt;
+    const effSpeed = p.slowT > 0 ? p.speed * 1.4 : p.speed;   // 1.8だと強すぎたので弱めた(2026-09-27)
+    const cellTime = CELL_TIME * effSpeed;
+    if (p.moveT >= cellTime) { p.moveT -= cellTime; p.idx++; }
+    if (p.idx >= p.path.length - 1) { p.done = true; escaped++; lastCat = p.cat; phase = 'over'; glog('escaped', { cat: p.cat }); }
+  }
+  // タワー(家族)が、射程内(自分のマス+隣接マス)の敵を自動で迎撃
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!grid[r][c]) continue;
+    const key = r + ',' + c;
+    if (cooldowns[key] > 0) continue;
+    const card = CARDS.find(cd => cd.id === grid[r][c]);
+    const rg = card.range || 1;
+    const inRange = p => !p.done && !p.dying && Math.abs(p.path[p.idx].r - r) <= rg && Math.abs(p.path[p.idx].c - c) <= rg;
+    // 範囲攻撃(aoe)は射程内の全員に当たる。単体火力の他3枚と、質そのものを変える(2026-09-26)
+    const targets = card.aoe ? posts.filter(inRange) : [posts.find(inRange)].filter(Boolean);
+    if (targets.length === 0) continue;
+    cooldowns[key] = card.cd;
+    if (targets.length > 1) glog('multiHit', { card: card.id, at: r + ',' + c, n: targets.length, cats: targets.map(t => t.cat) });   // 1発で複数体に当たった瞬間を記録(2026-09-27)
+    targets.forEach(target => {
+      const rawDmg = cardPower(card, target.cat);
+      const dmg = cardPowerPlayable(card, target.cat);   // 表示上の相性差はそのまま、実ダメージだけ底上げ
+      target.susp -= dmg;
+      if (card.slow) target.slowT = card.slow;   // スロウ効果(2026-09-26)
+      const tp = cellXY(target.path[target.idx].r, target.path[target.idx].c);
+      const strong = rawDmg >= card.power - 0.001;
+      popup(strong ? `-${Math.round(dmg)}!` : `-${Math.round(dmg)}`, tp.x, tp.y - 14, strong ? '#ffd23f' : '#8a847a');   // 当たった瞬間、必ず数字を出す(効いたかどうかも色で分かる)
+      projectiles.push({ from: cellXY(r, c), to: tp, t: 0, color: card.color });   // 攻撃してる感(飛んでいく軌跡)
+      if (target.susp <= 0 && !target.dying) { target.dying = true; target.dyingT = 0; calmed++; kizukai += KILL_REWARD; popup(`駆除した!+${KILL_REWARD}`, tp.x, tp.y, '#3a9d4f'); glog('kill', { card: card.id, cat: target.cat, at: r + ',' + c }); }
+    });
+    flashCell = { r, c, t: 0 };   // どのマスが撃ったかを、光らせて見せる
+  }
+  posts = posts.filter(p => !p.done);
+  if (spawned >= ROUND_POSTS && posts.length === 0 && phase === 'play') phase = (day >= TOTAL_DAYS) ? 'win' : 'clear';
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  // 背景: 机の質感(2026-09-27。Papers Please型トンマナ、第三者診断を反映)
+  ctx.fillStyle = '#2b2018'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+  for (let y = 0; y < H; y += 20) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  const lamp = ctx.createRadialGradient(W - 80, 40, 20, W * 0.4, H * 0.4, W * 0.9);
+  lamp.addColorStop(0, 'rgba(255,235,190,0.14)'); lamp.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = lamp; ctx.fillRect(0, 0, W, H);
+  // 上部バー
+  const topGrad = ctx.createLinearGradient(0, 0, W, 60);
+  topGrad.addColorStop(0, '#1c1712'); topGrad.addColorStop(1, '#332a1e');
+  ctx.fillStyle = topGrad; ctx.fillRect(0, 0, W, 60);
+  ctx.fillStyle = '#d8cca0'; ctx.font = '700 16px "Courier New",monospace'; ctx.textAlign = 'left';
+  ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 2; ctx.shadowOffsetX = 1; ctx.shadowOffsetY = 2;
+  ctx.fillText(`${day}日目/${TOTAL_DAYS}日   駆除予算 ${Math.floor(kizukai)}  (+${INCOME_PER_SEC}/秒)`, 12, 30);   // 収入が見える形にする
+  ctx.font = '400 11px monospace'; ctx.fillStyle = '#8a7f60';
+  ctx.fillText(`駆除した ${calmed} / 侵入された ${escaped}`, 12, 52);
+  ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+  // 盤面全体を「紙」として先に敷く(2026-09-27。以前は机の色がそのまま盤面になっていた)
+  paperPanel(GRID_LEFT - 6, GRID_TOP - 6, COLS * CELL + 12, ROWS * CELL + 12, false);
+  paperStain(GRID_LEFT + 10, GRID_TOP + 10, 40, 26, 0.4, 0.4);
+  paperStain(GRID_LEFT + COLS * CELL - 14, GRID_TOP + ROWS * CELL - 16, 34, 22, -0.3, 0.32);
+  // 盤面: まず、置いてあるタワーの「射程」を薄く敷く(なぜそこでダメージが入るかを、先に見せる)
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!grid[r][c]) continue;
+    const card = CARDS.find(cd => cd.id === grid[r][c]);
+    const rg = card.range || 1;
+    for (let dr = -rg; dr <= rg; dr++) for (let dc = -rg; dc <= rg; dc++) {
+      const rr = r + dr, cc = c + dc;
+      if (rr < 0 || rr >= ROWS || cc < 0 || cc >= COLS) continue;
+      ctx.fillStyle = hexA(card.color, 0.10);
+      ctx.fillRect(GRID_LEFT + cc * CELL, GRID_TOP + rr * CELL, CELL, CELL);
+    }
+  }
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const x = GRID_LEFT + c * CELL, y = GRID_TOP + r * CELL;
+    ctx.strokeStyle = 'rgba(60,50,30,0.12)'; ctx.lineWidth = 0.6; ctx.strokeRect(x, y, CELL, CELL);   // 紙のグリッドを薄くして、方眼紙的な機械感を消す(2026-09-27)
+    if (STARTS.some(s => s.r === r && s.c === c)) { ctx.fillStyle = 'rgba(179,38,30,0.15)'; ctx.fillRect(x, y, CELL, CELL); }
+    if (r === GOAL.r && c === GOAL.c) { ctx.fillStyle = 'rgba(58,157,79,0.25)'; ctx.fillRect(x, y, CELL, CELL); }
+    if (flashCell && flashCell.r === r && flashCell.c === c) { ctx.fillStyle = `rgba(255,210,63,${0.55 * (1 - flashCell.t / 0.25)})`; ctx.fillRect(x, y, CELL, CELL); }  // 撃った瞬間、パッと光る
+    if (grid[r][c]) {
+      // 二重構造: マスに置くのは「看板」(家族が大量に湧く違和感の解消、2026-09-25)。誰が書いた看板かは、小さい印だけで示す
+      const card = CARDS.find(cd => cd.id === grid[r][c]);
+      const isWall = card.id === 'ignore';
+      if (!isWall || !drawWallTexture(ctx, x + 3, y + 3, CELL - 6, CELL - 6, 0)) {
+        ctx.fillStyle = '#e4d6ac'; ctx.fillRect(x + 3, y + 3, CELL - 6, CELL - 6);   // 紙の看板。角丸をやめて盤面・手札と文法統一(2026-09-27)
+        paperFiber(x + 3, y + 3, CELL - 6, CELL - 6, x * 3 + y * 5);
+      }
+      ctx.strokeStyle = card.color; ctx.lineWidth = 2; ctx.strokeRect(x + 3, y + 3, CELL - 6, CELL - 6);
+      ctx.textAlign = 'center'; ctx.font = (CELL * 0.42) + 'px sans-serif';
+      ctx.fillText('📋', x + CELL / 2, y + CELL / 2 + CELL * 0.16);
+      // 誰が書いた看板か(小さい印、左上の丸バッジ)。実写画像があれば使う、無ければ絵文字(2026-09-27)
+      const cardImgKey = CARD_IMG_KEY[card.id];
+      if (!cardImgKey || !drawCharImg(ctx, cardImgKey, x + 12, y + 12, 10)) {
+        ctx.fillStyle = card.color; ctx.beginPath(); ctx.arc(x + 12, y + 12, 9, 0, 6.29); ctx.fill();
+        ctx.font = (CELL * 0.2) + 'px sans-serif'; ctx.fillText(card.whoIcon, x + 12, y + 16);
+      }
+      // 得意ジャンルの小さいアイコンを、看板の下に添える(何に効くかを常に見せる)
+      ctx.font = (CELL * 0.16) + 'px sans-serif';
+      const beatsIcons = [...new Set(card.beats.map(cat => CAT_STYLE[cat].icon))].join('');
+      ctx.fillText(beatsIcons, x + CELL / 2, y + CELL - 4);
+      // クールダウンを見える化(前は無く「なんで今効かないのか」が分からなかった。2026-09-26)
+      const cdKey = r + ',' + c, cdLeft = cooldowns[cdKey] || 0;
+      if (cdLeft > 0) {
+        const ratio = Math.min(1, cdLeft / card.cd);
+        ctx.fillStyle = 'rgba(30,26,22,0.45)';
+        ctx.beginPath(); ctx.moveTo(x + CELL / 2, y + CELL / 2);
+        ctx.arc(x + CELL / 2, y + CELL / 2, CELL * 0.46, -Math.PI / 2, -Math.PI / 2 + ratio * 6.283);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+  }
+  ctx.textAlign = 'center'; ctx.font = '700 20px sans-serif'; ctx.fillStyle = '#1e1a16';
+  STARTS.forEach(s => ctx.fillText('入口', cellXY(s.r, s.c).x, cellXY(s.r, s.c).y - CELL * 0.1));
+  { const gp = cellXY(GOAL.r, GOAL.c); ctx.fillText('🏠', gp.x, gp.y + CELL * 0.15); }
+  // 敵(情報)
+  posts.forEach(p => {
+    if (p.done) return;
+    if (p.dying) {   // 退場演出: モノクロ化+フェードアウト(2026-09-27、本人採用案)
+      const dcell = p.path[p.idx]; const dpos = cellXY(dcell.r, dcell.c);
+      const et = p.dyingT / DYING_DURATION, alpha = Math.max(0, 1 - et), gray = Math.min(1, et * 1.5);
+      const dImgKey = CAT_IMG_KEY[p.cat];
+      if (!dImgKey || !drawCharImg(ctx, dImgKey, dpos.x, dpos.y, CELL * 0.3, { grayscale: gray, alpha })) {
+        ctx.globalAlpha = alpha; ctx.fillStyle = CAT_STYLE[p.cat].color;
+        ctx.beginPath(); ctx.arc(dpos.x, dpos.y, CELL * 0.28, 0, 6.29); ctx.fill(); ctx.globalAlpha = 1;
+      }
+      // HPバーは即座に消し、本体だけゆっくりフェードアウトさせる(2026-09-27。バーごとフェードだと間延びして見えた)
+      return;
+    }
+    // 「あほに見える」対策: 今、何を根拠にどこへ歩いているかを線で見せる(2026-09-26)
+    ctx.strokeStyle = 'rgba(30,26,22,0.28)'; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    for (let i = p.idx; i < p.path.length; i++) {
+      const pt = cellXY(p.path[i].r, p.path[i].c);
+      if (i === p.idx) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+    const cell = p.path[p.idx]; const nextCell = p.path[Math.min(p.idx + 1, p.path.length - 1)];
+    const a = cellXY(cell.r, cell.c), b = cellXY(nextCell.r, nextCell.c);
+    const drawSpeed = p.slowT > 0 ? p.speed * 1.4 : p.speed;
+    const frac = p.moveT / (CELL_TIME * drawSpeed);
+    const x = a.x + (b.x - a.x) * frac, y = a.y + (b.y - a.y) * frac;
+    const cs = CAT_STYLE[p.cat];
+    // 今選んでるカードが、この敵に効くかどうかを、事前に見せる(置く前に効果が分かるように。2026-09-26)
+    if (curCardIdx >= 0 && curCardIdx < CARDS.length) {
+      const selCard = CARDS[curCardIdx];
+      const willBeStrong = selCard.weak === 1.0 || (STRONG[selCard.id] || []).includes(p.cat);
+      ctx.strokeStyle = willBeStrong ? '#3a9d4f' : '#b3261e'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(x, y, CELL * 0.38, 0, 6.29); ctx.stroke();
+      ctx.fillStyle = willBeStrong ? '#3a9d4f' : '#b3261e'; ctx.font = '700 10px sans-serif';
+      ctx.fillText(willBeStrong ? '効く!' : '効きにくい', x, y + CELL * 0.5);
+    }
+    if (p.slowT > 0) { ctx.strokeStyle = '#2f9fd0'; ctx.lineWidth = 2; ctx.setLineDash([2, 2]); ctx.beginPath(); ctx.arc(x, y, CELL * 0.34, 0, 6.29); ctx.stroke(); ctx.setLineDash([]); }   // スロウ中は青い点線の輪で見せる
+    const enemyImgKey = CAT_IMG_KEY[p.cat];
+    if (!enemyImgKey || !drawCharImg(ctx, enemyImgKey, x, y, CELL * 0.3)) {
+      ctx.fillStyle = cs.color;
+      ctx.beginPath(); ctx.arc(x, y, CELL * 0.28, 0, 6.29); ctx.fill();
+      ctx.font = (CELL * 0.22) + 'px sans-serif'; ctx.fillText(cs.icon, x, y + CELL * 0.06);   // ジャンルのアイコンを、敵自体に出す
+    }
+    // 縁取りを追加(2026-09-27)。実写画像に変えてから、白文字だけだと画像の明るさ次第で読めなくなっていた
+    ctx.font = '700 9px sans-serif'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 3; ctx.strokeText(p.str.slice(0, 6), x, y - CELL * 0.35);
+    ctx.fillStyle = '#fff'; ctx.fillText(p.str.slice(0, 6), x, y - CELL * 0.35);
+    // 体力バーを見やすく(前は高さ4pxで、削れてるかほぼ見えなかった。2026-09-26)
+    const ratio = Math.max(0, p.susp / MAX_SUSPICION);
+    const barW = CELL * 0.7, barH = 7, barX = x - barW / 2, barY = y + CELL * 0.34;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(barX, barY, barW, barH);
+    ctx.fillStyle = ratio > 0.5 ? '#ffd23f' : (ratio > 0.2 ? '#e08a2f' : '#c0392b');
+    ctx.fillRect(barX, barY, barW * ratio, barH);
+    ctx.strokeStyle = 'rgba(30,26,22,0.5)'; ctx.lineWidth = 1; ctx.strokeRect(barX, barY, barW, barH);
+    // 残りの体力を数字でも出す(バーの見た目だけだと「あと何発」が分からない、という指摘への対応。2026-09-26)
+    ctx.fillStyle = '#1e1a16'; ctx.font = '700 10px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(Math.max(0, Math.ceil(p.susp)), x, barY - 3);
+  });
+  // 攻撃してる感: タワーから敵へ、一瞬だけ線が飛ぶ(2026-09-26)
+  projectiles.forEach(p => {
+    ctx.globalAlpha = 1 - p.t / 0.15;
+    ctx.strokeStyle = p.color; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(p.from.x, p.from.y); ctx.lineTo(p.to.x, p.to.y); ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+  popups.forEach(p => { ctx.globalAlpha = Math.min(1, p.t / 0.3); ctx.fillStyle = p.color; ctx.font = '900 13px sans-serif'; ctx.fillText(p.str, p.x, p.y - (0.8 - p.t) * 20); });
+  ctx.globalAlpha = 1;
+
+  // 手札(2026-09-27。盤面・看板と同じ「紙」の文法に統一。以前は白背景の角丸カードで、盤面と別のUI言語になっていた)
+  const DOCK_Y = 700, DOCK_H = 90;
+  ctx.save(); ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = -3;
+  ctx.fillStyle = '#4a3f2c'; ctx.fillRect(0, DOCK_Y - 6, W, 6);
+  ctx.restore();
+  CARDS.forEach((c, i) => {
+    const curCost = effectiveCost(c);
+    const bx = 4 + i * (W / CARDS.length), bw = (W / CARDS.length) - 4, on = curCardIdx === i, afford = kizukai >= curCost;
+    paperPanel(bx, DOCK_Y, bw, DOCK_H, !on);
+    if (on) { ctx.strokeStyle = 'rgba(163,32,26,0.8)'; ctx.lineWidth = 1.5; ctx.strokeRect(bx + 1.5, DOCK_Y + 1.5, bw - 3, DOCK_H - 3); }
+    const txt = on ? '#241f18' : (afford ? 'rgba(60,52,36,0.8)' : 'rgba(60,52,36,0.4)');
+    ctx.fillStyle = txt; ctx.font = '700 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(c.who, bx + bw / 2, DOCK_Y + 14);
+    ctx.font = '700 9px sans-serif';
+    ctx.fillText(roleLabel(c), bx + bw / 2, DOCK_Y + 25);   // 何ができるかを、将棋の駒のように明示(2026-09-26)
+    if (!CARD_IMG_KEY[c.id] || !drawCharImg(ctx, CARD_IMG_KEY[c.id], bx + bw / 2, DOCK_Y + 46, DOCK_H * 0.24, { grayscale: on ? 0.3 : 0.6, alpha: on ? 1 : 0.75 })) {
+      ctx.fillStyle = txt; ctx.font = (DOCK_H * 0.26) + 'px sans-serif'; ctx.fillText(c.whoIcon, bx + bw / 2, DOCK_Y + 50);
+    }
+    ctx.fillStyle = txt; ctx.font = '400 10px sans-serif'; ctx.fillText('コスト' + curCost, bx + bw / 2, DOCK_Y + 64);
+    // 得意ジャンル(誰に効くか)を、アイコンで明示
+    ctx.font = (DOCK_H * 0.13) + 'px sans-serif';
+    ctx.fillText([...new Set(c.beats.map(cat => CAT_STYLE[cat].icon))].join(' '), bx + bw / 2, DOCK_Y + 82);
+  });
+
+  if (phase === 'prep') {
+    // 予告バーも紙の切れ端(付箋)風に。彩度の高いUIカラーでなく、書類のトーンで統一(2026-09-27)
+    paperPanel(0, 62, W, 42, false);
+    ctx.fillStyle = 'rgba(60,52,36,0.85)'; ctx.font = '700 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('最初に来る順番(予告)', W / 2, 76);
+    const preview = daySchedule.slice(0, 5);
+    preview.forEach((e, i) => {
+      const px = W / 2 - (preview.length - 1) * 22 + i * 44;
+      const entIdx = STARTS.indexOf(e.entrance);
+      ctx.fillStyle = 'rgba(60,52,36,0.12)'; ctx.beginPath(); ctx.arc(px, 90, 13, 0, 6.29); ctx.fill();   // アイコンの下に紙色の丸を敷いて馴染ませる
+      ctx.filter = 'saturate(0.5) sepia(0.15)'; ctx.font = '18px sans-serif'; ctx.fillText(CAT_STYLE[e.cat].icon, px, 96); ctx.filter = 'none';
+      ctx.font = '700 9px sans-serif'; ctx.fillStyle = 'rgba(120,70,40,0.85)';
+      ctx.fillText(entIdx === 0 ? '左口' : '右口', px, 108);
+    });
+    // 「はじめる」は彩度の高いボタンでなく、スタンプ風に(2026-09-27)
+    inkStamp(260, GRID_TOP + ROWS * CELL / 2, -0.06, 220, 56, 'rgba(70,110,60,0.9)', `${day}日目、はじめる`, 16);
+  }
+  if (phase === 'over' || phase === 'clear' || phase === 'win') {
+    ctx.fillStyle = '#211c16'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ffd23f'; ctx.font = '900 26px sans-serif';
+    const title = phase === 'win' ? '6日間、守りきった!' : phase === 'clear' ? `${day}日目は守りきった` : `${day}日目、ゲームオーバー`;
+    ctx.fillText(title, W / 2, 300);
+    if (phase === 'over') { ctx.fillStyle = '#f3efe6'; ctx.font = '600 15px sans-serif'; ctx.fillText(ENDINGS[lastCat] || '', W / 2, 350); }
+    ctx.fillStyle = '#f3efe6'; ctx.font = '600 15px sans-serif';
+    ctx.fillText(`駆除した ${calmed} / 侵入された ${escaped}`, W / 2, 400);
+    ctx.fillText(phase === 'over' ? 'タップで1日目から' : phase === 'win' ? 'タップでまた1日目から' : `タップで${day + 1}日目へ`, W / 2, 430);
+  }
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+document.getElementById('introStart').addEventListener('click', () => {
+  document.getElementById('intro').style.display = 'none';
+});
+
+cv.addEventListener('pointerdown', e => {
+  const rect = cv.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / rect.width * W, y = (e.clientY - rect.top) / rect.height * H;
+  if (phase === 'clear') { nextDay(); return; }
+  if (phase === 'over' || phase === 'win') { restart(); return; }
+  if (phase === 'prep' && x >= 160 && x <= 360 && Math.abs(y - (GRID_TOP + ROWS * CELL / 2)) < 25) { startDay(); return; }
+  if (y >= 700) { const i = Math.max(0, Math.min(CARDS.length - 1, Math.floor(x / (W / CARDS.length)))); curCardIdx = i; return; }
+  const c = Math.floor((x - GRID_LEFT) / CELL), r = Math.floor((y - GRID_TOP) / CELL);
+  if (r >= 0 && r < ROWS && c >= 0 && c < COLS) placeTower(r, c);
+});
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.__td = {
+    get day() { return day }, get phase() { return phase }, get posts() { return posts }, get kizukai() { return kizukai },
+    get calmed() { return calmed }, get escaped() { return escaped }, get grid() { return grid },
+    get curCardIdx() { return curCardIdx }, set curCardIdx(v) { curCardIdx = v },
+    CARDS, RESIST_CATS, STRONG, TOTAL_DAYS, get START() { return START }, get STARTS() { return STARTS }, GOAL, ROWS, COLS,
+    get daySchedule() { return daySchedule }, entranceCountForDay, ENTRANCE_OVERRIDE,
+    setupDay, startDay, placeTower, update, findPath, findPathWeighted, cardPower,
+    get gameLog() { return gameLog }, clearLog: () => { gameLog = []; try { localStorage.removeItem('td_gamelog'); } catch (e) {} },
+  };
+}
+</script>
+</body></html>
